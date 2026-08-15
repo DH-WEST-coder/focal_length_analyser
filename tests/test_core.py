@@ -98,7 +98,9 @@ def test_export_dataset_outputs_and_handoff(tmp_path):
     handoff = out_dir / "AI_HANDOFF.md"
     assert handoff.exists()
     content = handoff.read_text(encoding="utf-8")
-    assert "AI 분석 의뢰 가이드" in content
+    assert "AI 분석용 핸드오프" in content
     assert "preference_score.csv" in content
-    assert "단렌즈 영입 고민" in content
-
+    assert "불완전 연도" in content
+    assert "합성 점수이지 절대적 진실이 아니다" in content
+    assert "폴더명이나 초점거리만으로 장르를 지어내지 마라" in content
+    assert "90분 세션 및 5초 burst" in content

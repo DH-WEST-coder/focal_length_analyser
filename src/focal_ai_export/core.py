@@ -505,6 +505,79 @@ def _write_csv(path: Path, rows: list[dict[str, object]], fields: list[str]) -> 
         writer.writerows(rows)
 
 
+def build_ai_handoff(session_gap_minutes: int, burst_gap_seconds: int) -> str:
+    return f"""# AI 분석용 핸드오프
+
+이 폴더는 원본 촬영 전체가 아니라 **최종 선택·보정해서 남긴 사진**의 EXIF 데이터입니다. 아래 파일과 프롬프트를 함께 AI에 전달하세요.
+
+## 첨부할 파일
+
+기본 분석에는 다음 파일이면 충분합니다.
+
+- `dataset.json`
+- `monthly_data_quality.csv`
+- `preference_score.csv`
+- `yearly_summary.csv`
+- `exact_focal_usage.csv`
+- `log_focal_cluster_usage.csv`
+- `rolling_12m_summary.csv`
+- `zoom_position_usage.csv`
+- `lens_observed_coverage.csv`
+
+사진별 근거를 다시 계산하거나 폴더·카메라별 조건부 분석이 필요할 때만 `photos.csv` 또는 `photos.jsonl`을 추가하세요.
+
+## 복사용 분석 프롬프트
+
+```text
+첨부 파일은 내가 최종 선택하고 보정해서 남긴 사진의 EXIF 기반 데이터다. 목표는 단순 사용량이 아니라, 어떤 35mm 환산 화각이 최종 결과물에서 반복적으로 살아남는지와 그 선호가 시간·렌즈 종류에 따라 어떻게 달라졌는지를 판단하는 것이다.
+
+다음 순서와 규칙으로 분석하라.
+
+1. 먼저 데이터 품질을 감사하라.
+- dataset.json과 monthly_data_quality.csv에서 전체 레코드 수, 35mm 환산값 사용 가능 비율, EXIF 직접값/카메라별 crop factor 보완값/결측값을 구분하라.
+- 관측된 월, active month, 촬영일 수를 이용해 불완전 연도를 식별하라. 불완전 연도끼리 또는 완전 연도와 원시 사진 장수를 직접 비교하지 마라.
+- DateTimeOriginal이 아닌 폴더 날짜 대체 레코드와 lens_type=unknown의 규모를 한계로 표시하라.
+
+2. 최종 결과물 선호도를 분석하라.
+- photo_weight를 대표 지표로 사용하라. shooting_day_weight는 여러 촬영일에서 반복됐는지, month_weight는 여러 달에 걸쳐 지속됐는지 확인하는 보조 지표다.
+- preference_score.csv의 50/30/20 점수는 편의상 만든 합성 점수이지 절대적 진실이 아니다. 순위만 인용하지 말고 photo_share, shooting_day_share, month_share, photo_day_harmonic_share를 함께 제시하라.
+- '결과물 비중과 촬영일 비중이 모두 높은 구조적 핵심 화각', '결과물 비중은 높지만 일부 촬영일에 집중된 화각', '장수는 적어도 여러 촬영일에서 반복된 화각'을 구분하라.
+
+3. 초점거리 분포를 올바르게 요약하라.
+- 산술평균은 보조값으로만 쓰고 weighted median, Q1/Q3, geometric mean을 우선하라.
+- exact_focal_usage.csv와 log_focal_cluster_usage.csv를 함께 보라. 줌렌즈의 인접 exact 값들을 서로 다른 강한 선호로 과대해석하지 마라.
+- 각 핵심 주장에는 연도, 렌즈군, 가중 방식, 비중 또는 중앙값 등 수치 근거를 붙여라.
+
+4. 전체·단렌즈·줌렌즈를 분리하라.
+- 전체는 최종 결과물의 시야각 구성, prime은 단렌즈 선택 화각, zoom은 실제 선택된 환산 초점거리로 해석하라.
+- zoom_position_usage.csv는 전체 줌 합계와 렌즈 모델별 결과를 모두 확인하라. 서로 다른 초점거리 범위의 줌렌즈에서 같은 zoom_position이 같은 시야각을 뜻한다고 가정하지 마라.
+- 광각단·광각측·중간·망원측·망원단 분포와 exact_wide_end_share/exact_tele_end_share를 제시하라. 평균 줌 위치 하나로 분포 형태를 단정하지 마라.
+
+5. 시간 변화를 보수적으로 판단하라.
+- yearly_summary.csv와 rolling_12m_summary.csv를 함께 사용하라.
+- 12개월 롤링 결과는 window_month_count가 12보다 작으면 부분 창으로 표시하라.
+- 변화가 photo/day/month 관점에서 일관적인지 확인하고, 표본 범위 변화나 특정 렌즈의 관측 시작·종료와 겹치면 취향 변화로 단정하지 마라.
+
+6. 교란요인을 명시하라.
+- lens_observed_coverage.csv의 first/last_observed_at은 데이터상 최초·최종 관측일일 뿐 구매일·판매일·실제 보유기간이 아니다.
+- 카메라·렌즈 구성 변화, 촬영 장르, 장소, 피사체는 데이터만으로 확정할 수 없다. 폴더명이나 초점거리만으로 장르를 지어내지 마라.
+- focal_35mm_source=derived_camera_median은 추정값으로 구분하고 missing은 환산 초점거리 통계에서 제외하라.
+- session_weight와 burst_weight는 {session_gap_minutes}분 세션 및 {burst_gap_seconds}초 burst 가정에 따른 진단값이다. 이 보정본 데이터의 주 결론에는 사용하지 말고, 사용한다면 민감도와 가정을 명시하라.
+
+출력 형식:
+A. 데이터 품질과 비교 가능 범위
+B. 전체 핵심 화각: exact와 log cluster 기준 TOP 5 표
+C. 연도 및 12개월 롤링 변화
+D. 단렌즈 분석
+E. 줌렌즈 실제 화각 및 렌즈별 줌 위치 분석
+F. 구조적 핵심 / 특정 촬영 집중 / 넓게 반복되는 화각 분류
+G. 데이터가 말해주는 결론과 말해주지 못하는 한계
+
+마지막에는 근거가 강한 결론, 가능성 수준의 해석, 추가 데이터가 필요한 추정을 분리하라. 제품명이나 구매 추천은 가격·크기·조리개·용도 같은 조건이 제공되지 않았다면 단정하지 말고, 우선 적합한 35mm 환산 화각 범위만 제안하라.
+```
+"""
+
+
 def export_dataset(root: Path, output: Path, session_gap_minutes: int = 90, burst_gap_seconds: int = 5) -> Path:
     root = root.resolve()
     paths = find_images(root)
@@ -540,73 +613,8 @@ def export_dataset(root: Path, output: Path, session_gap_minutes: int = 90, burs
     _write_csv(output / "session_gap_sensitivity.csv", sensitivity, list(sensitivity[0]) if sensitivity else ["session_gap_minutes", "session_count", "year", "lens_group", "weighting"])
     _write_csv(output / "lens_observed_coverage.csv", lens_observations, list(lens_observations[0]) if lens_observations else ["camera_model", "lens_model", "lens_type", "first_observed_at", "last_observed_at", "photo_count", "shooting_day_count", "active_month_count", "session_count"])
     _write_csv(output / "preference_score.csv", preference_scores, list(preference_scores[0]) if preference_scores else ["year", "lens_group", "representation", "rank", "focal_35mm_mm", "photo_share", "shooting_day_share", "month_share", "composite_score_50_30_20", "photo_day_harmonic_share", "all_components_available"])
-    (output / "AI_HANDOFF.md").write_text(f"""# AI 분석 의뢰 가이드 (Focal AI Export)
-
-이 데이터셋은 원본 사진을 손상시키지 않고 EXIF 메타데이터를 정밀 분석한 결과물입니다.
-ChatGPT, Claude 등 AI 모델에 파일과 함께 아래 프롬프트를 전달하여 맞춤형 분석 및 렌즈 추천을 받으실 수 있습니다.
-
----
-
-## 📁 AI 파일 첨부 팁
-- **기본 추천 (가장 빠르고 정확함)**: 아래 핵심 CSV 파일들을 AI 채팅창에 첨부하세요.
-  - `preference_score.csv` (종합 선호도 순위)
-  - `yearly_summary.csv` (연도/렌즈군별 평균·중앙값·사분위수)
-  - `zoom_position_usage.csv` (줌렌즈 구간별 활용률)
-  - `lens_observed_coverage.csv` (렌즈별 관측 데이터 요약)
-  - `monthly_data_quality.csv` (월별 촬영 활성도)
-- **개별 사진 단위 정밀 분석이 필요한 경우**: `photos.jsonl` 또는 `photos.csv`를 추가로 첨부하세요. (대용량 사진인 경우 파일 크기에 주의)
-
----
-
-## 📋 바로 복사해서 쓰는 AI 프롬프트
-
-### [기본] 데이터 해석 원칙 & 공통 프롬프트
-```text
-[역할 및 데이터 특성]
-너는 전문 사진 데이터 분석가이자 렌즈 컨설턴트야. 첨부된 파일들은 내가 직접 촬영하고 최종 선택·보정하여 남긴 사진들의 EXIF 분석 데이터셋이다.
-
-[해석 가이드라인]
-1. 대표 지표: 'photo_weight'는 최종 선택된 결과물의 대표 선호 지표이다.
-2. 반복성 & 지속성: 'shooting_day_weight'(여러 날에 걸친 반복 선택)와 'month_weight'(계절/장기 지속성)를 함께 교차 검증해줘.
-3. 종합 점수: 'preference_score.csv'의 50/30/20 점수(photo 50% + day 30% + month 20%)와 photo/day 조화평균을 참고하되 각 구성요소를 분리해서 설명해줘.
-4. 화각 중심 통계: 초점거리는 로그 분포 특성을 가지므로 산술평균보다는 '기하평균(geometric mean)', '중앙값(median)', 'Q1/Q3 사분위수'를 메인으로 분석해줘. exact 화각과 log cluster(1/6 stop)를 같이 살펴봐줘.
-5. 단/줌 분리: 단렌즈와 줌렌즈는 사용 행태가 다르므로 통계 및 인사이트를 반드시 분리해서 제시해줘. 줌렌즈는 'zoom_position_usage.csv'를 기반으로 광각단/망원단 편중 여부를 진단해줘.
-6. 주의사항:
-   - 'session_weight'와 'burst_weight'는 촬영 행동 진단용 보조값이며 메인 결론으로 쓰지 마.
-   - 'lens_observed_coverage.csv'의 최초/최종 관측일은 데이터상 기록일 뿐, 실제 구매·방출일로 단정하지 마.
-   - 'derived_camera_median'으로 추정된 화각은 추정값임을 명시해줘.
-
-[출력 형식]
-1. 핵심 인사이트 요약 (3줄)
-2. 주력 선호 화각 TOP 3 및 정량적 근거 (표 포함)
-3. 단렌즈 vs 줌렌즈 사용 패턴 및 줌 구간 진단
-4. 맞춤형 렌즈 구성 및 촬영 추천 제안
-```
-
----
-
-### [목적별 맞춤 질문 템플릿]
-
-#### 🎯 1. 단렌즈 영입 고민 (내가 가장 만족할 단렌즈 화각 찾기)
-> "위의 데이터 해석 원칙을 바탕으로, 내가 새로 단렌즈를 하나만 들인다면 몇 mm(35mm 환산 기준)를 가장 추천하는지 `preference_score.csv`와 `yearly_summary.csv`를 근거로 추천해줘. 줌렌즈에서 자주 멈춰 섰던 화각과 실제 단렌즈 사용 결과물을 종합해줘."
-
-#### 🔍 2. 줌렌즈 활용 진단 (내가 줌렌즈를 제대로 쓰고 있을까?)
-> "내 줌렌즈 사용 패턴을 진단해줘. `zoom_position_usage.csv`를 참고해서 내가 줌렌즈를 골고루 활용하고 있는지, 아니면 특정 양 끝단(광각단/망원단)에 갇혀 쓰는지 분석해줘. 만약 특정 화각에 편중되어 있다면 단렌즈 전환이 유리할지도 의견을 줘."
-
-#### ⚖️ 3. 렌즈 다이어트 / 시스템 정리
-> "현재 내가 사용하는 렌즈군(`lens_observed_coverage.csv` 및 연도별 사용량) 중에서 활용도가 떨어지거나 화각이 중복되어 방출을 고려해볼 만한 렌즈와, 반드시 유지해야 할 핵심 렌즈를 분석해줘."
-
----
-
-## 📊 핵심 파일 & 필드 설명서
-
-- `preference_score.csv`: 정규화된 Photo(50%) + Shooting Day(30%) + Month(20%) 복합 선호 점수
-- `yearly_summary.csv`: 연도·렌즈군·가중치별 산술·기하평균, 중앙값, 사분위수(IQR)
-- `zoom_position_usage.csv`: 전체 및 렌즈 모델별 5구간 줌 위치(`wide_end`, `wide_side`, `middle`, `tele_side`, `tele_end`) 및 끝단 비율
-- `exact_focal_usage.csv` / `log_focal_cluster_usage.csv`: 정확한 초점거리 및 1/6 스톱 단위 클러스터별 점유율
-- `lens_observed_coverage.csv`: 렌즈별 데이터상 관측 기간과 총 촬영 통계
-- `monthly_data_quality.csv`: 월별 유효 EXIF 비율 및 활성 촬영 월(`active_month`) 판별
-- `session_gap_sensitivity.csv`: 세션 분리 기준({session_gap_minutes}분 등)에 따른 통계 민감도
-""", encoding="utf-8")
+    (output / "AI_HANDOFF.md").write_text(
+        build_ai_handoff(session_gap_minutes, burst_gap_seconds),
+        encoding="utf-8",
+    )
     return output
-
