@@ -21,6 +21,8 @@ class ExportApp(tk.Tk):
         self.configure(bg="#F5F7FB")
         self.input_path = tk.StringVar(value=str(Path.home() / "Pictures"))
         self.output_path = tk.StringVar(value=str(Path.home() / "Desktop"))
+        self.session_gap = tk.StringVar(value="90")
+        self.burst_gap = tk.StringVar(value="5")
         self.status = tk.StringVar(value="사진은 읽기 전용으로 스캔됩니다. 시작할 준비가 됐어요.")
         self.events = queue.Queue()
         self._configure_style()
@@ -64,6 +66,13 @@ class ExportApp(tk.Tk):
             entry.pack(side="left", fill="x", expand=True, ipady=6)
             ttk.Button(row, text="폴더 선택", command=chooser, style="Browse.TButton").pack(side="left", padx=(10, 0))
 
+        options = ttk.Frame(outer, style="Card.TFrame")
+        options.pack(fill="x", pady=(0, 14))
+        ttk.Label(options, text="세션 분리(분)", style="Section.TLabel").pack(side="left")
+        ttk.Entry(options, textvariable=self.session_gap, width=6, font=("Helvetica", 11)).pack(side="left", padx=(7, 22), ipady=4)
+        ttk.Label(options, text="Burst 간격(초)", style="Section.TLabel").pack(side="left")
+        ttk.Entry(options, textvariable=self.burst_gap, width=6, font=("Helvetica", 11)).pack(side="left", padx=(7, 0), ipady=4)
+
         self.button = ttk.Button(outer, text="AI 데이터 내보내기", command=self._start, style="Accent.TButton")
         self.button.pack(anchor="w", pady=(1, 16))
         ttk.Label(outer, textvariable=self.status, style="Status.TLabel", wraplength=660, padding=(14, 12)).pack(fill="x")
@@ -81,12 +90,24 @@ class ExportApp(tk.Tk):
         source, destination = Path(self.input_path.get()), Path(self.output_path.get())
         if not source.is_dir() or not destination.is_dir():
             messagebox.showerror("폴더 오류", "유효한 사진 폴더와 결과 저장 위치를 선택하세요."); return
-        self.button.configure(state="disabled"); self.status.set("EXIF를 읽는 중…")
-        threading.Thread(target=self._work, args=(source, destination), daemon=True).start()
-
-    def _work(self, source: Path, destination: Path):
         try:
-            result = export_dataset(source, destination / f"FocalAIExport_{datetime.now():%Y%m%d_%H%M%S}")
+            session_gap, burst_gap = int(self.session_gap.get()), int(self.burst_gap.get())
+            if session_gap < 1 or burst_gap < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("설정 오류", "세션 간격은 1분 이상, Burst 간격은 0초 이상 정수여야 합니다.")
+            return
+        self.button.configure(state="disabled"); self.status.set("EXIF를 읽는 중…")
+        threading.Thread(target=self._work, args=(source, destination, session_gap, burst_gap), daemon=True).start()
+
+    def _work(self, source: Path, destination: Path, session_gap: int, burst_gap: int):
+        try:
+            result = export_dataset(
+                source,
+                destination / f"FocalAIExport_{datetime.now():%Y%m%d_%H%M%S}",
+                session_gap,
+                burst_gap,
+            )
             self.events.put(("done", result))
         except Exception as error:
             self.events.put(("error", str(error)))

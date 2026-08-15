@@ -6,7 +6,7 @@ import math
 import re
 import statistics
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -17,6 +17,10 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".tif", ".tiff", ".heic", ".heif"}
 FOCAL_BINS = (("<24", 0, 24), ("24-34", 24, 35), ("35-49", 35, 50),
               ("50-84", 50, 85), ("85-134", 85, 135), ("135-199", 135, 200),
               ("200+", 200, math.inf))
+ZOOM_POSITION_BINS = (("wide_end", 0, .1), ("wide_side", .1, .35),
+                      ("middle", .35, .65), ("tele_side", .65, .9),
+                      ("tele_end", .9, 1.0000001))
+LOG_CLUSTER_STEPS_PER_STOP = 6  # Half-bin width is about ±5.9%.
 
 
 @dataclass
@@ -27,6 +31,7 @@ class PhotoRecord:
     month: int | None
     day: int | None
     date_source: str
+    captured_at: str | None
     camera_model: str
     lens_model: str
     lens_type: str
@@ -37,10 +42,18 @@ class PhotoRecord:
     lens_min_actual_mm: float | None
     lens_max_actual_mm: float | None
     zoom_position_log: float | None
+    zoom_position_bin: str | None
+    is_exact_zoom_wide_end: bool | None
+    is_exact_zoom_tele_end: bool | None
     focal_bin_35mm: str | None
+    focal_log_cluster_mm: float | None
     photo_weight: float
     shooting_day_weight: float | None = None
     month_weight: float | None = None
+    burst_id: str | None = None
+    burst_weight: float | None = None
+    session_id: str | None = None
+    session_weight: float | None = None
 
 
 def _number(value) -> float | None:
@@ -126,6 +139,65 @@ def focal_bin(value: float | None) -> str | None:
     return next(label for label, low, high in FOCAL_BINS if low <= value < high)
 
 
+def focal_log_cluster(value: float | None) -> float | None:
+    """Nearest 1/6-stop focal cluster; a bin is approximately ±5.9% wide."""
+    if value is None or value <= 0:
+        return None
+    return round(2 ** (round(math.log2(value) * LOG_CLUSTER_STEPS_PER_STOP) / LOG_CLUSTER_STEPS_PER_STOP), 3)
+
+
+def zoom_position_bin(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return next(label for label, low, high in ZOOM_POSITION_BINS if low <= value < high)
+
+
+def _same_burst_choice(previous: PhotoRecord, current: PhotoRecord) -> bool:
+    if previous.lens_model != current.lens_model:
+        return False
+    if previous.focal_actual_mm is not None and current.focal_actual_mm is not None:
+        return math.isclose(previous.focal_actual_mm, current.focal_actual_mm, rel_tol=.001)
+    if previous.focal_35mm_mm is not None and current.focal_35mm_mm is not None:
+        return math.isclose(previous.focal_35mm_mm, current.focal_35mm_mm, rel_tol=.001)
+    return False
+
+
+def _assign_decision_units(records: list[PhotoRecord], session_gap_minutes: int, burst_gap_seconds: int) -> dict[str, int]:
+    """Assign sessions and compressed burst decisions using DateTimeOriginal only."""
+    dated: list[tuple[datetime, PhotoRecord]] = []
+    for record in records:
+        if record.captured_at:
+            dated.append((datetime.fromisoformat(record.captured_at), record))
+    dated.sort(key=lambda item: (item[0], item[1].source_file))
+    sessions: list[list[tuple[datetime, PhotoRecord]]] = []
+    for item in dated:
+        if not sessions or (item[0] - sessions[-1][-1][0]).total_seconds() > session_gap_minutes * 60:
+            sessions.append([item])
+        else:
+            sessions[-1].append(item)
+    burst_total = 0
+    for session_number, session in enumerate(sessions, start=1):
+        session_id = f"session_{session_number:05d}"
+        bursts: list[list[tuple[datetime, PhotoRecord]]] = []
+        for item in session:
+            if (bursts and (item[0] - bursts[-1][-1][0]).total_seconds() <= burst_gap_seconds
+                    and _same_burst_choice(bursts[-1][-1][1], item[1])):
+                bursts[-1].append(item)
+            else:
+                bursts.append([item])
+        for burst_number, burst in enumerate(bursts, start=1):
+            burst_id = f"{session_id}_burst_{burst_number:04d}"
+            per_photo_burst = 1 / len(burst)
+            per_photo_session = 1 / (len(bursts) * len(burst))
+            for _, record in burst:
+                record.session_id = session_id
+                record.burst_id = burst_id
+                record.burst_weight = per_photo_burst
+                record.session_weight = per_photo_session
+        burst_total += len(bursts)
+    return {"session_count": len(sessions), "burst_count": burst_total, "records_without_timestamp": len(records) - len(dated)}
+
+
 def find_images(root: Path) -> list[Path]:
     root = root.resolve()
     return sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS and not any(part.startswith(".") for part in path.parts))
@@ -135,7 +207,7 @@ def snapshot(paths: Iterable[Path]) -> list[tuple[str, int, int]]:
     return [(str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths]
 
 
-def scan(root: Path) -> tuple[list[PhotoRecord], dict[str, object]]:
+def scan(root: Path, session_gap_minutes: int = 90, burst_gap_seconds: int = 5) -> tuple[list[PhotoRecord], dict[str, object]]:
     root = root.resolve()
     preliminary: list[PhotoRecord] = []
     quality: Counter[str] = Counter()
@@ -164,16 +236,20 @@ def scan(root: Path) -> tuple[list[PhotoRecord], dict[str, object]]:
             source_file=str(path.relative_to(root)),
             source_group=(path.relative_to(root).parts[0] if len(path.relative_to(root).parts) > 1 else "."),
             year=year, month=month, day=day, date_source=date_source,
+            captured_at=taken.isoformat(timespec="seconds") if taken else None,
             camera_model=_text(tags.get("Model")) or "Unknown camera",
             lens_model=_text(tags.get("LensModel")) or "Unknown lens", lens_type=category,
             focal_actual_mm=actual, focal_35mm_mm=equivalent,
             focal_35mm_source="exif" if equivalent else "missing", crop_factor=None,
             lens_min_actual_mm=low, lens_max_actual_mm=high, zoom_position_log=zoom_position,
-            focal_bin_35mm=focal_bin(equivalent), photo_weight=1.0,
+            zoom_position_bin=zoom_position_bin(zoom_position),
+            is_exact_zoom_wide_end=(math.isclose(actual, low, rel_tol=.005) if category == "zoom" and actual and low else None),
+            is_exact_zoom_tele_end=(math.isclose(actual, high, rel_tol=.005) if category == "zoom" and actual and high else None),
+            focal_bin_35mm=focal_bin(equivalent), focal_log_cluster_mm=focal_log_cluster(equivalent), photo_weight=1.0,
         ))
     factors: dict[str, list[float]] = defaultdict(list)
     for record in preliminary:
-        if record.focal_actual_mm and record.focal_35mm_mm:
+        if record.camera_model != "Unknown camera" and record.focal_actual_mm and record.focal_35mm_mm:
             ratio = record.focal_35mm_mm / record.focal_actual_mm
             if .5 <= ratio <= 10:
                 factors[record.camera_model].append(ratio)
@@ -184,6 +260,7 @@ def scan(root: Path) -> tuple[list[PhotoRecord], dict[str, object]]:
             record.focal_35mm_mm = record.focal_actual_mm * record.crop_factor
             record.focal_35mm_source = "derived_camera_median"
             record.focal_bin_35mm = focal_bin(record.focal_35mm_mm)
+            record.focal_log_cluster_mm = focal_log_cluster(record.focal_35mm_mm)
             quality["derived_equivalent"] += 1
         if record.focal_35mm_mm is None:
             quality["missing_equivalent"] += 1
@@ -196,6 +273,7 @@ def scan(root: Path) -> tuple[list[PhotoRecord], dict[str, object]]:
             record.shooting_day_weight = 1 / day_groups[(record.year, record.month, record.day)]
         if record.year and record.month:
             record.month_weight = 1 / month_groups[(record.year, record.month)]
+    decision_metadata = _assign_decision_units(preliminary, session_gap_minutes=session_gap_minutes, burst_gap_seconds=burst_gap_seconds)
     metadata = {
         "quality": dict(quality),
         "camera_crop_factors": {
@@ -203,6 +281,8 @@ def scan(root: Path) -> tuple[list[PhotoRecord], dict[str, object]]:
             for camera, factor in medians.items()
         },
         "focal_bins_35mm": [label for label, _, _ in FOCAL_BINS],
+        "zoom_position_bins": [label for label, _, _ in ZOOM_POSITION_BINS],
+        "decision_units": {"session_gap_minutes": session_gap_minutes, "burst_gap_seconds": burst_gap_seconds, **decision_metadata},
     }
     return preliminary, metadata
 
@@ -223,7 +303,7 @@ def _weighted_quantile(values: list[tuple[float, float]], q: float) -> float | N
 def _summary_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
     """Machine-readable descriptive statistics; it makes no preference claim."""
     rows: list[dict[str, object]] = []
-    weight_specs = (("photo", "photo_weight"), ("shooting_day", "shooting_day_weight"), ("month", "month_weight"))
+    weight_specs = (("photo", "photo_weight"), ("shooting_day", "shooting_day_weight"), ("month", "month_weight"), ("session", "session_weight"), ("burst", "burst_weight"))
     for year in sorted({record.year for record in records if record.year is not None}):
         annual = [record for record in records if record.year == year]
         for lens_group in ("all", "prime", "zoom"):
@@ -232,16 +312,20 @@ def _summary_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
                 values = [(record.focal_35mm_mm, getattr(record, field)) for record in group if record.focal_35mm_mm is not None and getattr(record, field) is not None]
                 weighted_n = sum(weight for _, weight in values)
                 mean = sum(value * weight for value, weight in values) / weighted_n if weighted_n else None
+                log_mean = sum(math.log2(value) * weight for value, weight in values) / weighted_n if weighted_n else None
+                q1, median, q3 = _weighted_quantile(values, .25), _weighted_quantile(values, .5), _weighted_quantile(values, .75)
                 rows.append({"year": year, "lens_group": lens_group, "weighting": weight_name,
                              "record_count": len(group), "usable_equivalent_count": len(values), "weighted_sample_size": weighted_n,
-                             "mean_35mm_mm": mean, "median_35mm_mm": _weighted_quantile(values, .5),
-                             "q1_35mm_mm": _weighted_quantile(values, .25), "q3_35mm_mm": _weighted_quantile(values, .75)})
+                             "mean_35mm_mm": mean, "geometric_mean_35mm_mm": 2 ** log_mean if log_mean is not None else None,
+                             "mean_log2_focal": log_mean, "median_35mm_mm": median,
+                             "q1_35mm_mm": q1, "q3_35mm_mm": q3,
+                             "iqr_log2_stops": math.log2(q3 / q1) if q1 and q3 else None})
     return rows
 
 
 def _exact_focal_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    weight_specs = (("photo", "photo_weight"), ("shooting_day", "shooting_day_weight"), ("month", "month_weight"))
+    weight_specs = (("photo", "photo_weight"), ("shooting_day", "shooting_day_weight"), ("month", "month_weight"), ("session", "session_weight"), ("burst", "burst_weight"))
     for year in sorted({record.year for record in records if record.year is not None}):
         for lens_group in ("all", "prime", "zoom"):
             group = [record for record in records if record.year == year and (lens_group == "all" or record.lens_type == lens_group) and record.focal_35mm_mm is not None]
@@ -252,10 +336,165 @@ def _exact_focal_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
                     if weight is not None:
                         counts[record.focal_35mm_mm] += weight
                 total = sum(counts.values())
+                ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
                 rows.extend({"year": year, "lens_group": lens_group, "weighting": weight_name,
-                             "focal_35mm_mm": focal, "weighted_count": count,
+                             "rank": rank, "focal_35mm_mm": focal, "weighted_count": count,
                              "weighted_share": count / total if total else None}
-                            for focal, count in sorted(counts.items()))
+                            for rank, (focal, count) in enumerate(ranked, start=1))
+    return rows
+
+
+def _log_cluster_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    weight_specs = (("photo", "photo_weight"), ("shooting_day", "shooting_day_weight"), ("month", "month_weight"), ("session", "session_weight"), ("burst", "burst_weight"))
+    for year in sorted({record.year for record in records if record.year is not None}):
+        for lens_group in ("all", "prime", "zoom"):
+            group = [record for record in records if record.year == year and record.focal_log_cluster_mm is not None and (lens_group == "all" or record.lens_type == lens_group)]
+            for weight_name, field in weight_specs:
+                counts: defaultdict[float, float] = defaultdict(float)
+                for record in group:
+                    weight = getattr(record, field)
+                    if weight is not None:
+                        counts[record.focal_log_cluster_mm] += weight
+                total = sum(counts.values())
+                ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+                rows.extend({"year": year, "lens_group": lens_group, "weighting": weight_name,
+                             "rank": rank, "log_cluster_center_35mm_mm": focal, "weighted_count": count,
+                             "weighted_share": count / total if total else None}
+                            for rank, (focal, count) in enumerate(ranked, start=1))
+    return rows
+
+
+def _monthly_quality_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for year, month in sorted({(r.year, r.month) for r in records if r.year and r.month}):
+        group = [r for r in records if r.year == year and r.month == month]
+        dated_days = {(r.year, r.month, r.day) for r in group if r.date_source == "DateTimeOriginal" and r.day}
+        sessions = {r.session_id for r in group if r.session_id}
+        usable = sum(r.focal_35mm_mm is not None for r in group)
+        exif = sum(r.focal_35mm_source == "exif" for r in group)
+        derived = sum(r.focal_35mm_source == "derived_camera_median" for r in group)
+        rows.append({"year": year, "month": month, "photo_count": len(group), "usable_equivalent_count": usable,
+                     "usable_equivalent_ratio": usable / len(group) if group else None, "exif_equivalent_count": exif,
+                     "derived_equivalent_count": derived, "datetimeoriginal_count": sum(r.date_source == "DateTimeOriginal" for r in group),
+                     "shooting_day_count": len(dated_days), "session_count": len(sessions),
+                     "active_month": len(dated_days) >= 3 or len(group) >= 50})
+    return rows
+
+
+def _zoom_position_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    weight_specs = (("photo", "photo_weight"), ("shooting_day", "shooting_day_weight"), ("month", "month_weight"), ("session", "session_weight"), ("burst", "burst_weight"))
+    for year in sorted({record.year for record in records if record.year is not None}):
+        zooms = [r for r in records if r.year == year and r.lens_type == "zoom" and r.zoom_position_bin]
+        for lens_model in sorted({r.lens_model for r in zooms} | {"__all_zoom_lenses__"}):
+            group = zooms if lens_model == "__all_zoom_lenses__" else [r for r in zooms if r.lens_model == lens_model]
+            for weight_name, field in weight_specs:
+                counts: defaultdict[str, float] = defaultdict(float)
+                wide_end = tele_end = 0.0
+                for record in group:
+                    weight = getattr(record, field)
+                    if weight is not None:
+                        counts[record.zoom_position_bin] += weight
+                        wide_end += weight if record.is_exact_zoom_wide_end else 0
+                        tele_end += weight if record.is_exact_zoom_tele_end else 0
+                total = sum(counts.values())
+                for position, count in counts.items():
+                    rows.append({"year": year, "lens_model": lens_model, "weighting": weight_name,
+                                 "zoom_position_bin": position, "weighted_count": count,
+                                 "weighted_share": count / total if total else None,
+                                 "exact_wide_end_share": wide_end / total if total else None,
+                                 "exact_tele_end_share": tele_end / total if total else None})
+    return rows
+
+
+def _rolling_12m_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    endpoints = sorted({(r.year, r.month) for r in records if r.year and r.month})
+    for end_year, end_month in endpoints:
+        end_index = end_year * 12 + end_month - 1
+        window = [r for r in records if r.year and r.month and end_index - 11 <= r.year * 12 + r.month - 1 <= end_index]
+        observed_months = len({(r.year, r.month) for r in window})
+        for lens_group in ("all", "prime", "zoom"):
+            group = window if lens_group == "all" else [r for r in window if r.lens_type == lens_group]
+            for weight_name, field in (("photo", "photo_weight"), ("shooting_day", "shooting_day_weight"), ("month", "month_weight")):
+                values = [(r.focal_35mm_mm, getattr(r, field)) for r in group if r.focal_35mm_mm is not None and getattr(r, field) is not None]
+                total = sum(weight for _, weight in values)
+                log_mean = sum(math.log2(value) * weight for value, weight in values) / total if total else None
+                q1, median, q3 = _weighted_quantile(values, .25), _weighted_quantile(values, .5), _weighted_quantile(values, .75)
+                rows.append({"window_end_year": end_year, "window_end_month": end_month, "window_month_count": observed_months,
+                             "lens_group": lens_group, "weighting": weight_name, "record_count": len(group),
+                             "weighted_sample_size": total, "geometric_mean_35mm_mm": 2 ** log_mean if log_mean is not None else None,
+                             "median_35mm_mm": median, "q1_35mm_mm": q1, "q3_35mm_mm": q3,
+                             "iqr_log2_stops": math.log2(q3 / q1) if q1 and q3 else None})
+    return rows
+
+
+def _session_sensitivity_rows(records: list[PhotoRecord], selected_gap: int, burst_gap: int) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for gap in sorted({60, 90, 120, selected_gap}):
+        copies = [replace(record, session_id=None, burst_id=None, session_weight=None, burst_weight=None) for record in records]
+        counts = _assign_decision_units(copies, gap, burst_gap)
+        for row in _summary_rows(copies):
+            if row["weighting"] == "session":
+                rows.append({"session_gap_minutes": gap, "session_count": counts["session_count"], **row})
+    return rows
+
+
+def _lens_observation_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
+    """Observed data coverage only; this does not claim acquisition or ownership dates."""
+    rows: list[dict[str, object]] = []
+    for camera, lens in sorted({(r.camera_model, r.lens_model) for r in records}):
+        group = [r for r in records if r.camera_model == camera and r.lens_model == lens]
+        timestamps = sorted(r.captured_at for r in group if r.captured_at)
+        rows.append({"camera_model": camera, "lens_model": lens,
+                     "lens_type": Counter(r.lens_type for r in group).most_common(1)[0][0],
+                     "first_observed_at": timestamps[0] if timestamps else None,
+                     "last_observed_at": timestamps[-1] if timestamps else None,
+                     "photo_count": len(group),
+                     "shooting_day_count": len({(r.year, r.month, r.day) for r in group if r.captured_at}),
+                     "active_month_count": len({(r.year, r.month) for r in group if r.year and r.month}),
+                     "session_count": len({r.session_id for r in group if r.session_id})})
+    return rows
+
+
+def _preference_score_rows(records: list[PhotoRecord]) -> list[dict[str, object]]:
+    """Final-edit preference score from normalized photo/day/month shares."""
+    rows: list[dict[str, object]] = []
+    components = (("photo_share", "photo_weight"), ("shooting_day_share", "shooting_day_weight"), ("month_share", "month_weight"))
+    for year in sorted({r.year for r in records if r.year is not None}):
+        for lens_group in ("all", "prime", "zoom"):
+            base = [r for r in records if r.year == year and (lens_group == "all" or r.lens_type == lens_group)]
+            for representation, getter in (("exact", lambda r: r.focal_35mm_mm), ("log_cluster", lambda r: r.focal_log_cluster_mm)):
+                shares: dict[str, dict[float, float]] = {}
+                complete = True
+                for label, field in components:
+                    counts: defaultdict[float, float] = defaultdict(float)
+                    for record in base:
+                        focal, weight = getter(record), getattr(record, field)
+                        if focal is not None and weight is not None:
+                            counts[focal] += weight
+                    total = sum(counts.values())
+                    if not total:
+                        complete = False
+                    shares[label] = {focal: count / total for focal, count in counts.items()} if total else {}
+                candidates = set().union(*(mapping.keys() for mapping in shares.values()))
+                scored = []
+                for focal in candidates:
+                    photo = shares["photo_share"].get(focal, 0.0)
+                    day = shares["shooting_day_share"].get(focal, 0.0)
+                    month = shares["month_share"].get(focal, 0.0)
+                    composite = .5 * photo + .3 * day + .2 * month if complete else None
+                    concurrence = 2 * photo * day / (photo + day) if photo + day else 0.0
+                    scored.append((focal, photo, day, month, composite, concurrence))
+                scored.sort(key=lambda item: (-(item[4] if item[4] is not None else -1), item[0]))
+                rows.extend({"year": year, "lens_group": lens_group, "representation": representation,
+                             "rank": rank, "focal_35mm_mm": focal, "photo_share": photo,
+                             "shooting_day_share": day, "month_share": month,
+                             "composite_score_50_30_20": composite,
+                             "photo_day_harmonic_share": concurrence,
+                             "all_components_available": complete}
+                            for rank, (focal, photo, day, month, composite, concurrence) in enumerate(scored, start=1))
     return rows
 
 
@@ -266,11 +505,11 @@ def _write_csv(path: Path, rows: list[dict[str, object]], fields: list[str]) -> 
         writer.writerows(rows)
 
 
-def export_dataset(root: Path, output: Path) -> Path:
+def export_dataset(root: Path, output: Path, session_gap_minutes: int = 90, burst_gap_seconds: int = 5) -> Path:
     root = root.resolve()
     paths = find_images(root)
     before = snapshot(paths)
-    records, metadata = scan(root)
+    records, metadata = scan(root, session_gap_minutes=session_gap_minutes, burst_gap_seconds=burst_gap_seconds)
     if before != snapshot(paths):
         raise RuntimeError("원본 파일 변화가 감지되어 결과를 저장하지 않았습니다.")
     output.mkdir(parents=True, exist_ok=False)
@@ -280,14 +519,94 @@ def export_dataset(root: Path, output: Path) -> Path:
         for record in records:
             handle.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
     dataset = {
-        "format": "focal-ai-export/v1", "created_at": datetime.now().isoformat(timespec="seconds"),
+        "format": "focal-ai-export/v2", "created_at": datetime.now().isoformat(timespec="seconds"),
         "record_count": len(records), "schema": {name: str(type_) for name, type_ in PhotoRecord.__annotations__.items()},
         "metadata": metadata,
-        "privacy": "source_file is relative to the selected folder; absolute paths, GPS, serial numbers, and image pixels are not exported.",
+        "privacy": "Absolute paths, GPS, serial numbers, and image pixels are not exported. Relative filenames and EXIF capture timestamps are included for grouping and auditability.",
     }
     (output / "dataset.json").write_text(json.dumps(dataset, ensure_ascii=False, indent=2), encoding="utf-8")
     summary, exact_focals = _summary_rows(records), _exact_focal_rows(records)
-    _write_csv(output / "yearly_summary.csv", summary, list(summary[0]) if summary else ["year", "lens_group", "weighting", "record_count", "usable_equivalent_count", "weighted_sample_size", "mean_35mm_mm", "median_35mm_mm", "q1_35mm_mm", "q3_35mm_mm"])
-    _write_csv(output / "exact_focal_usage.csv", exact_focals, list(exact_focals[0]) if exact_focals else ["year", "lens_group", "weighting", "focal_35mm_mm", "weighted_count", "weighted_share"])
-    (output / "AI_HANDOFF.md").write_text("""# AI 분석 의뢰용 데이터\n\n`photos.jsonl` 또는 `photos.csv`와 `yearly_summary.csv`, `exact_focal_usage.csv`를 AI에 첨부하세요. 이 데이터는 인사이트를 포함하지 않는 원시·파생 EXIF 데이터셋입니다.\n\n## 권장 요청문\n\n이 데이터에서 연도별 35mm 환산 초점거리 사용 변화, 사진/촬영일/월 가중치의 차이, 단렌즈와 줌렌즈의 차이, 줌 위치를 분석해줘. `focal_35mm_source`가 `missing`인 레코드는 환산 초점거리 통계에서 제외하고, `derived_camera_median`은 별도 표시해줘. 불완전 연도는 `date_source`, `year`, `month`을 확인해 보수적으로 해석해줘.\n\n## 필드\n\n- `focal_35mm_mm`: 35mm 환산 초점거리.\n- `focal_35mm_source`: `exif`, `derived_camera_median`, `missing`.\n- `photo_weight`, `shooting_day_weight`, `month_weight`: 세 관점의 가중치.\n- `lens_type`: `prime`, `zoom`, `unknown`.\n- `zoom_position_log`: 줌 범위에서 로그 기준 위치(0=광각단, 1=망원단).\n- `yearly_summary.csv`: 연도·렌즈군·가중치별 평균, 중앙값, 사분위수.\n- `exact_focal_usage.csv`: 초점거리 구간으로 뭉개지지 않은 정확한 35mm 환산 초점거리별 가중 사용량.\n""", encoding="utf-8")
+    log_clusters, monthly_quality = _log_cluster_rows(records), _monthly_quality_rows(records)
+    zoom_positions, rolling = _zoom_position_rows(records), _rolling_12m_rows(records)
+    sensitivity = _session_sensitivity_rows(records, session_gap_minutes, burst_gap_seconds)
+    lens_observations = _lens_observation_rows(records)
+    preference_scores = _preference_score_rows(records)
+    _write_csv(output / "yearly_summary.csv", summary, list(summary[0]) if summary else ["year", "lens_group", "weighting", "record_count", "usable_equivalent_count", "weighted_sample_size", "mean_35mm_mm", "geometric_mean_35mm_mm", "mean_log2_focal", "median_35mm_mm", "q1_35mm_mm", "q3_35mm_mm", "iqr_log2_stops"])
+    _write_csv(output / "exact_focal_usage.csv", exact_focals, list(exact_focals[0]) if exact_focals else ["year", "lens_group", "weighting", "rank", "focal_35mm_mm", "weighted_count", "weighted_share"])
+    _write_csv(output / "log_focal_cluster_usage.csv", log_clusters, list(log_clusters[0]) if log_clusters else ["year", "lens_group", "weighting", "rank", "log_cluster_center_35mm_mm", "weighted_count", "weighted_share"])
+    _write_csv(output / "monthly_data_quality.csv", monthly_quality, list(monthly_quality[0]) if monthly_quality else ["year", "month", "photo_count", "usable_equivalent_count", "usable_equivalent_ratio", "exif_equivalent_count", "derived_equivalent_count", "datetimeoriginal_count", "shooting_day_count", "session_count", "active_month"])
+    _write_csv(output / "zoom_position_usage.csv", zoom_positions, list(zoom_positions[0]) if zoom_positions else ["year", "lens_model", "weighting", "zoom_position_bin", "weighted_count", "weighted_share", "exact_wide_end_share", "exact_tele_end_share"])
+    _write_csv(output / "rolling_12m_summary.csv", rolling, list(rolling[0]) if rolling else ["window_end_year", "window_end_month", "window_month_count", "lens_group", "weighting", "record_count", "weighted_sample_size", "geometric_mean_35mm_mm", "median_35mm_mm", "q1_35mm_mm", "q3_35mm_mm", "iqr_log2_stops"])
+    _write_csv(output / "session_gap_sensitivity.csv", sensitivity, list(sensitivity[0]) if sensitivity else ["session_gap_minutes", "session_count", "year", "lens_group", "weighting"])
+    _write_csv(output / "lens_observed_coverage.csv", lens_observations, list(lens_observations[0]) if lens_observations else ["camera_model", "lens_model", "lens_type", "first_observed_at", "last_observed_at", "photo_count", "shooting_day_count", "active_month_count", "session_count"])
+    _write_csv(output / "preference_score.csv", preference_scores, list(preference_scores[0]) if preference_scores else ["year", "lens_group", "representation", "rank", "focal_35mm_mm", "photo_share", "shooting_day_share", "month_share", "composite_score_50_30_20", "photo_day_harmonic_share", "all_components_available"])
+    (output / "AI_HANDOFF.md").write_text(f"""# AI 분석 의뢰 가이드 (Focal AI Export)
+
+이 데이터셋은 원본 사진을 손상시키지 않고 EXIF 메타데이터를 정밀 분석한 결과물입니다.
+ChatGPT, Claude 등 AI 모델에 파일과 함께 아래 프롬프트를 전달하여 맞춤형 분석 및 렌즈 추천을 받으실 수 있습니다.
+
+---
+
+## 📁 AI 파일 첨부 팁
+- **기본 추천 (가장 빠르고 정확함)**: 아래 핵심 CSV 파일들을 AI 채팅창에 첨부하세요.
+  - `preference_score.csv` (종합 선호도 순위)
+  - `yearly_summary.csv` (연도/렌즈군별 평균·중앙값·사분위수)
+  - `zoom_position_usage.csv` (줌렌즈 구간별 활용률)
+  - `lens_observed_coverage.csv` (렌즈별 관측 데이터 요약)
+  - `monthly_data_quality.csv` (월별 촬영 활성도)
+- **개별 사진 단위 정밀 분석이 필요한 경우**: `photos.jsonl` 또는 `photos.csv`를 추가로 첨부하세요. (대용량 사진인 경우 파일 크기에 주의)
+
+---
+
+## 📋 바로 복사해서 쓰는 AI 프롬프트
+
+### [기본] 데이터 해석 원칙 & 공통 프롬프트
+```text
+[역할 및 데이터 특성]
+너는 전문 사진 데이터 분석가이자 렌즈 컨설턴트야. 첨부된 파일들은 내가 직접 촬영하고 최종 선택·보정하여 남긴 사진들의 EXIF 분석 데이터셋이다.
+
+[해석 가이드라인]
+1. 대표 지표: 'photo_weight'는 최종 선택된 결과물의 대표 선호 지표이다.
+2. 반복성 & 지속성: 'shooting_day_weight'(여러 날에 걸친 반복 선택)와 'month_weight'(계절/장기 지속성)를 함께 교차 검증해줘.
+3. 종합 점수: 'preference_score.csv'의 50/30/20 점수(photo 50% + day 30% + month 20%)와 photo/day 조화평균을 참고하되 각 구성요소를 분리해서 설명해줘.
+4. 화각 중심 통계: 초점거리는 로그 분포 특성을 가지므로 산술평균보다는 '기하평균(geometric mean)', '중앙값(median)', 'Q1/Q3 사분위수'를 메인으로 분석해줘. exact 화각과 log cluster(1/6 stop)를 같이 살펴봐줘.
+5. 단/줌 분리: 단렌즈와 줌렌즈는 사용 행태가 다르므로 통계 및 인사이트를 반드시 분리해서 제시해줘. 줌렌즈는 'zoom_position_usage.csv'를 기반으로 광각단/망원단 편중 여부를 진단해줘.
+6. 주의사항:
+   - 'session_weight'와 'burst_weight'는 촬영 행동 진단용 보조값이며 메인 결론으로 쓰지 마.
+   - 'lens_observed_coverage.csv'의 최초/최종 관측일은 데이터상 기록일 뿐, 실제 구매·방출일로 단정하지 마.
+   - 'derived_camera_median'으로 추정된 화각은 추정값임을 명시해줘.
+
+[출력 형식]
+1. 핵심 인사이트 요약 (3줄)
+2. 주력 선호 화각 TOP 3 및 정량적 근거 (표 포함)
+3. 단렌즈 vs 줌렌즈 사용 패턴 및 줌 구간 진단
+4. 맞춤형 렌즈 구성 및 촬영 추천 제안
+```
+
+---
+
+### [목적별 맞춤 질문 템플릿]
+
+#### 🎯 1. 단렌즈 영입 고민 (내가 가장 만족할 단렌즈 화각 찾기)
+> "위의 데이터 해석 원칙을 바탕으로, 내가 새로 단렌즈를 하나만 들인다면 몇 mm(35mm 환산 기준)를 가장 추천하는지 `preference_score.csv`와 `yearly_summary.csv`를 근거로 추천해줘. 줌렌즈에서 자주 멈춰 섰던 화각과 실제 단렌즈 사용 결과물을 종합해줘."
+
+#### 🔍 2. 줌렌즈 활용 진단 (내가 줌렌즈를 제대로 쓰고 있을까?)
+> "내 줌렌즈 사용 패턴을 진단해줘. `zoom_position_usage.csv`를 참고해서 내가 줌렌즈를 골고루 활용하고 있는지, 아니면 특정 양 끝단(광각단/망원단)에 갇혀 쓰는지 분석해줘. 만약 특정 화각에 편중되어 있다면 단렌즈 전환이 유리할지도 의견을 줘."
+
+#### ⚖️ 3. 렌즈 다이어트 / 시스템 정리
+> "현재 내가 사용하는 렌즈군(`lens_observed_coverage.csv` 및 연도별 사용량) 중에서 활용도가 떨어지거나 화각이 중복되어 방출을 고려해볼 만한 렌즈와, 반드시 유지해야 할 핵심 렌즈를 분석해줘."
+
+---
+
+## 📊 핵심 파일 & 필드 설명서
+
+- `preference_score.csv`: 정규화된 Photo(50%) + Shooting Day(30%) + Month(20%) 복합 선호 점수
+- `yearly_summary.csv`: 연도·렌즈군·가중치별 산술·기하평균, 중앙값, 사분위수(IQR)
+- `zoom_position_usage.csv`: 전체 및 렌즈 모델별 5구간 줌 위치(`wide_end`, `wide_side`, `middle`, `tele_side`, `tele_end`) 및 끝단 비율
+- `exact_focal_usage.csv` / `log_focal_cluster_usage.csv`: 정확한 초점거리 및 1/6 스톱 단위 클러스터별 점유율
+- `lens_observed_coverage.csv`: 렌즈별 데이터상 관측 기간과 총 촬영 통계
+- `monthly_data_quality.csv`: 월별 유효 EXIF 비율 및 활성 촬영 월(`active_month`) 판별
+- `session_gap_sensitivity.csv`: 세션 분리 기준({session_gap_minutes}분 등)에 따른 통계 민감도
+""", encoding="utf-8")
     return output
+
