@@ -1,0 +1,70 @@
+name: Build release packages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build macOS app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Build app bundle
+        run: >-
+          python -m PyInstaller --noconfirm --clean --windowed
+          --name FocalAIExport --paths ./src src/main.py
+      - name: Package app bundle
+        run: ditto -c -k --sequesterRsrc --keepParent dist/FocalAIExport.app dist/FocalAIExport-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FocalAIExport-macos
+          path: dist/FocalAIExport-macos.zip
+
+  build-windows:
+    name: Build Windows executable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Build executable
+        run: >-
+          python -m PyInstaller --noconfirm --clean --windowed --onefile
+          --name FocalAIExport --paths ./src src/main.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FocalAIExport-windows
+          path: dist/FocalAIExport.exe
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Create release and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          release-assets/FocalAIExport-macos/FocalAIExport-macos.zip
+          release-assets/FocalAIExport-windows/FocalAIExport.exe
+          --title "Focal AI Export $GITHUB_REF_NAME"
+          --generate-notes
